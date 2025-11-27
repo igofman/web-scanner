@@ -16,15 +16,40 @@ WORKDIR /app
 
 # Copy project files
 COPY pyproject.toml .
+COPY README.md .
 COPY src/ src/
 
-# Create virtual environment and install dependencies using uv
+# Install dependencies using uv with pip
+# First install the build backend, then the package
 ENV UV_SYSTEM_PYTHON=1
-RUN uv pip install --system .
+RUN uv pip install --system hatchling && \
+    uv pip install --system .
 
-# Install Playwright browsers
-RUN playwright install chromium && \
-    playwright install-deps chromium
+# Install Playwright browsers (need to install deps in builder too)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libnss3 \
+    libnspr4 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libdbus-1-3 \
+    libxkbcommon0 \
+    libatspi2.0-0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
+    libpango-1.0-0 \
+    libcairo2 \
+    libglib2.0-0 \
+    libgtk-3-0 \
+    libx11-xcb1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN playwright install chromium
 
 # Final stage
 FROM python:3.11-slim
@@ -52,6 +77,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libasound2 \
     libpango-1.0-0 \
     libcairo2 \
+    libglib2.0-0 \
+    libgtk-3-0 \
+    libx11-xcb1 \
     # Java for LanguageTool
     default-jre-headless \
     && rm -rf /var/lib/apt/lists/*
