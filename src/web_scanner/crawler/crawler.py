@@ -1,13 +1,14 @@
-"""Core web crawler implementation."""
+"""Core web crawler implementation using Playwright for JavaScript support."""
 
 import asyncio
 import time
+from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
-import httpx
 import structlog
-from bs4 import BeautifulSoup
+from playwright.async_api import Page, TimeoutError as PlaywrightTimeout
 
+from ..browser import BrowserManager, SmartPageLoader, retry_with_backoff
 from ..config import settings
 from ..models import CrawledPage, PageStatus
 
@@ -15,7 +16,15 @@ logger = structlog.get_logger()
 
 
 class WebCrawler:
-    """Recursive web crawler that discovers and fetches pages."""
+    """
+    Playwright-based web crawler that discovers and fetches pages.
+
+    Uses a real browser to:
+    - Execute JavaScript fully
+    - Render dynamic content
+    - Capture accurate screenshots
+    - Extract links from fully-rendered DOM
+    """
 
     def __init__(
         self,
@@ -23,17 +32,22 @@ class WebCrawler:
         max_depth: int | None = None,
         max_pages: int | None = None,
         concurrent_requests: int | None = None,
+        screenshot_dir: Path | None = None,
+        capture_screenshots: bool = True,
     ):
         self.base_url = base_url.rstrip("/")
         self.base_domain = urlparse(base_url).netloc
         self.max_depth = max_depth or settings.max_depth
         self.max_pages = max_pages or settings.max_pages
         self.concurrent_requests = concurrent_requests or settings.concurrent_requests
+        self.screenshot_dir = screenshot_dir
+        self.capture_screenshots = capture_screenshots
 
         self.visited_urls: set[str] = set()
         self.crawled_pages: list[CrawledPage] = []
         self.url_queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue()
         self._semaphore: asyncio.Semaphore | None = None
+        self._browser_manager: BrowserManager | None = None
 
     def _normalize_url(self, url: str) -> str:
         """Normalize a URL by removing fragments and trailing slashes."""
@@ -61,7 +75,7 @@ class WebCrawler:
                 ".pdf", ".jpg", ".jpeg", ".png", ".gif", ".svg", ".ico",
                 ".css", ".js", ".xml", ".json", ".zip", ".tar", ".gz",
                 ".mp3", ".mp4", ".avi", ".mov", ".webm", ".woff", ".woff2",
-                ".ttf", ".eot",
+                ".ttf", ".eot", ".map",
             )
             path_lower = parsed.path.lower()
             if any(path_lower.endswith(ext) for ext in skip_extensions):
@@ -71,130 +85,141 @@ class WebCrawler:
         except Exception:
             return False
 
-    def _extract_links(self, html: str, current_url: str) -> list[str]:
-        """Extract all valid links from HTML content."""
-        links = []
-        try:
-            soup = BeautifulSoup(html, "lxml")
-            for anchor in soup.find_all("a", href=True):
-                href = anchor["href"]
+    def _url_to_filename(self, url: str, extension: str) -> str:
+        """Convert URL to a safe filename."""
+        parsed = urlparse(url)
+        path = parsed.path.strip("/") or "index"
 
-                # Skip javascript, mailto, tel links
-                if href.startswith(("javascript:", "mailto:", "tel:", "#")):
-                    continue
+        # Replace path separators and special chars
+        safe_name = path.replace("/", "_").replace("?", "_").replace("&", "_")
 
-                # Convert relative URLs to absolute
-                absolute_url = urljoin(current_url, href)
-                normalized = self._normalize_url(absolute_url)
+        # Add query hash if present
+        if parsed.query:
+            import hashlib
+            query_hash = hashlib.md5(parsed.query.encode()).hexdigest()[:8]
+            safe_name = f"{safe_name}_{query_hash}"
 
-                if self._is_valid_url(normalized):
-                    links.append(normalized)
-        except Exception as e:
-            logger.warning("Error extracting links", url=current_url, error=str(e))
+        return f"{safe_name}.{extension}"
 
-        return list(set(links))
+    def _filter_links(self, links: list[str], current_url: str) -> list[str]:
+        """Filter and normalize extracted links."""
+        filtered = []
+        for link in links:
+            # Convert relative URLs to absolute
+            absolute_url = urljoin(current_url, link)
+            normalized = self._normalize_url(absolute_url)
 
-    def _extract_text(self, html: str) -> str:
-        """Extract readable text from HTML content."""
-        try:
-            soup = BeautifulSoup(html, "lxml")
+            if self._is_valid_url(normalized) and normalized not in filtered:
+                filtered.append(normalized)
 
-            # Remove script and style elements
-            for element in soup(["script", "style", "noscript", "header", "footer", "nav"]):
-                element.decompose()
+        return filtered
 
-            text = soup.get_text(separator="\n", strip=True)
-
-            # Clean up multiple newlines
-            lines = [line.strip() for line in text.splitlines() if line.strip()]
-            return "\n".join(lines)
-        except Exception:
-            return ""
-
-    def _extract_title(self, html: str) -> str | None:
-        """Extract page title from HTML."""
-        try:
-            soup = BeautifulSoup(html, "lxml")
-            title_tag = soup.find("title")
-            return title_tag.get_text(strip=True) if title_tag else None
-        except Exception:
-            return None
-
-    async def _fetch_page(self, url: str, depth: int, client: httpx.AsyncClient) -> CrawledPage:
-        """Fetch a single page and extract its content."""
+    async def _fetch_page(
+        self,
+        url: str,
+        depth: int,
+        page: Page,
+    ) -> CrawledPage:
+        """Fetch a single page using Playwright and extract its content."""
         start_time = time.time()
+        screenshot_path: str | None = None
 
         try:
-            response = await client.get(
-                url,
-                timeout=settings.request_timeout,
-                follow_redirects=True,
+            # Create smart page loader
+            loader = SmartPageLoader(
+                page=page,
+                wait_for_timeout=settings.js_wait_timeout,
+                wait_for_selector=settings.wait_for_selector,
             )
-            response_time = (time.time() - start_time) * 1000
 
-            content_type = response.headers.get("content-type", "")
+            # Navigate with retry logic
+            async def navigate():
+                success = await loader.goto(
+                    url,
+                    timeout=settings.page_load_timeout,
+                    wait_until="networkidle",
+                )
+                if not success:
+                    raise Exception("Navigation failed")
+                return success
 
-            # Only process HTML pages
-            if "text/html" not in content_type:
+            try:
+                await retry_with_backoff(
+                    navigate,
+                    max_retries=settings.max_retries,
+                    base_delay=1.0,
+                )
+            except Exception as e:
+                response_time = (time.time() - start_time) * 1000
                 return CrawledPage(
                     url=url,
-                    status=PageStatus.SUCCESS,
-                    status_code=response.status_code,
-                    content_type=content_type,
+                    status=PageStatus.ERROR,
                     depth=depth,
+                    error_message=str(e),
                     response_time_ms=response_time,
                 )
 
-            html = response.text
-            text = self._extract_text(html)
-            title = self._extract_title(html)
-            links = self._extract_links(html, url)
+            response_time = (time.time() - start_time) * 1000
+
+            # Extract content from fully rendered page
+            html = await loader.get_content()
+            text = await loader.get_text()
+            title = await loader.get_title()
+            raw_links = await loader.get_links()
+            links = self._filter_links(raw_links, url)
+
+            # Capture screenshot if enabled
+            if self.capture_screenshots and self.screenshot_dir:
+                filename = self._url_to_filename(url, "png")
+                screenshot_path = str(self.screenshot_dir / filename)
+                screenshot_success = await loader.capture_screenshot(
+                    path=screenshot_path,
+                    full_page=settings.screenshot_full_page,
+                )
+                if screenshot_success:
+                    logger.info("Captured screenshot", url=url, path=screenshot_path)
+                else:
+                    screenshot_path = None
 
             return CrawledPage(
                 url=url,
                 status=PageStatus.SUCCESS,
-                status_code=response.status_code,
-                content_type=content_type,
+                status_code=200,
+                content_type="text/html",
                 html=html,
                 text=text,
                 title=title,
                 links=links,
                 depth=depth,
                 response_time_ms=response_time,
+                screenshot_path=screenshot_path,
             )
 
-        except httpx.TimeoutException:
+        except PlaywrightTimeout:
+            response_time = (time.time() - start_time) * 1000
             return CrawledPage(
                 url=url,
                 status=PageStatus.TIMEOUT,
                 depth=depth,
-                error_message="Request timed out",
-                response_time_ms=(time.time() - start_time) * 1000,
-            )
-        except httpx.HTTPStatusError as e:
-            status = PageStatus.NOT_FOUND if e.response.status_code == 404 else PageStatus.ERROR
-            return CrawledPage(
-                url=url,
-                status=status,
-                status_code=e.response.status_code,
-                depth=depth,
-                error_message=str(e),
-                response_time_ms=(time.time() - start_time) * 1000,
+                error_message="Page load timed out",
+                response_time_ms=response_time,
             )
         except Exception as e:
+            response_time = (time.time() - start_time) * 1000
+            logger.error("Failed to fetch page", url=url, error=str(e))
             return CrawledPage(
                 url=url,
                 status=PageStatus.ERROR,
                 depth=depth,
                 error_message=str(e),
-                response_time_ms=(time.time() - start_time) * 1000,
+                response_time_ms=response_time,
             )
 
-    async def _worker(self, client: httpx.AsyncClient) -> None:
+    async def _worker(self, worker_id: int) -> None:
         """Worker coroutine that processes URLs from the queue."""
         while True:
             try:
-                url, depth = await asyncio.wait_for(self.url_queue.get(), timeout=2.0)
+                url, depth = await asyncio.wait_for(self.url_queue.get(), timeout=5.0)
             except asyncio.TimeoutError:
                 break
 
@@ -205,34 +230,48 @@ class WebCrawler:
             self.visited_urls.add(url)
 
             async with self._semaphore:
-                logger.info("Crawling page", url=url, depth=depth)
-                page = await self._fetch_page(url, depth, client)
-                self.crawled_pages.append(page)
+                logger.info("Crawling page", url=url, depth=depth, worker=worker_id)
 
-                # Add discovered links to queue
-                if page.status == PageStatus.SUCCESS and depth < self.max_depth:
-                    for link in page.links:
-                        if link not in self.visited_urls:
-                            await self.url_queue.put((link, depth + 1))
+                # Create a new page for this request
+                async with self._browser_manager.new_page() as page:
+                    crawled_page = await self._fetch_page(url, depth, page)
+                    self.crawled_pages.append(crawled_page)
+
+                    # Add discovered links to queue
+                    if crawled_page.status == PageStatus.SUCCESS and depth < self.max_depth:
+                        for link in crawled_page.links:
+                            if link not in self.visited_urls:
+                                await self.url_queue.put((link, depth + 1))
 
             self.url_queue.task_done()
 
     async def crawl(self) -> list[CrawledPage]:
         """Start crawling from the base URL."""
-        logger.info("Starting crawl", base_url=self.base_url, max_depth=self.max_depth)
+        logger.info(
+            "Starting crawl",
+            base_url=self.base_url,
+            max_depth=self.max_depth,
+            max_pages=self.max_pages,
+        )
 
         self._semaphore = asyncio.Semaphore(self.concurrent_requests)
+
+        # Ensure screenshot directory exists
+        if self.capture_screenshots and self.screenshot_dir:
+            self.screenshot_dir.mkdir(parents=True, exist_ok=True)
 
         # Start with the base URL
         await self.url_queue.put((self.base_url, 0))
 
-        headers = {"User-Agent": settings.user_agent}
+        # Initialize browser manager
+        self._browser_manager = BrowserManager()
+        await self._browser_manager.start()
 
-        async with httpx.AsyncClient(headers=headers) as client:
+        try:
             # Create worker tasks
             workers = [
-                asyncio.create_task(self._worker(client))
-                for _ in range(self.concurrent_requests)
+                asyncio.create_task(self._worker(i))
+                for i in range(self.concurrent_requests)
             ]
 
             # Wait for all work to complete
@@ -241,6 +280,10 @@ class WebCrawler:
             # Cancel workers
             for worker in workers:
                 worker.cancel()
+
+        finally:
+            # Always cleanup browser
+            await self._browser_manager.stop()
 
         logger.info(
             "Crawl completed",

@@ -8,7 +8,7 @@ import structlog
 
 from .config import settings
 from .crawler import WebCrawler
-from .extractors import HTMLExtractor, TextExtractor, ScreenshotExtractor
+from .extractors import HTMLExtractor, TextExtractor
 from .analyzers import GrammarAnalyzer, LinkAnalyzer, OCRAnalyzer
 from .storage import StorageManager
 from .models import AnalysisReport, CrawledPage, ExtractedData, PageStatus
@@ -17,7 +17,12 @@ logger = structlog.get_logger()
 
 
 class ScanOrchestrator:
-    """Orchestrates the complete website scanning and analysis workflow."""
+    """Orchestrates the complete website scanning and analysis workflow.
+
+    The new architecture uses Playwright for both crawling and screenshots,
+    capturing screenshots during the crawl phase for better accuracy with
+    JavaScript-rendered content.
+    """
 
     def __init__(
         self,
@@ -41,17 +46,21 @@ class ScanOrchestrator:
         # Initialize storage
         self.storage = StorageManager(url, output_dir)
 
-        # Initialize components
+        # Screenshot directory (used during crawl)
+        self.screenshot_dir = self.storage.get_output_dir() / "screenshots" if not skip_screenshots else None
+
+        # Initialize crawler with integrated screenshot support
         self.crawler = WebCrawler(
             url,
             max_depth=self.max_depth,
             max_pages=self.max_pages,
+            screenshot_dir=self.screenshot_dir,
+            capture_screenshots=not skip_screenshots,
         )
 
-        # Initialize extractors
+        # Initialize extractors (for saving HTML/text to files)
         self.html_extractor = HTMLExtractor(self.storage.get_output_dir())
         self.text_extractor = TextExtractor(self.storage.get_output_dir())
-        self.screenshot_extractor = ScreenshotExtractor(self.storage.get_output_dir()) if not skip_screenshots else None
 
         # Initialize analyzers
         self.grammar_analyzer = GrammarAnalyzer() if not skip_grammar else None
@@ -74,17 +83,17 @@ class ScanOrchestrator:
         )
 
         try:
-            # Phase 1: Crawl
-            logger.info("Phase 1: Crawling website")
+            # Phase 1: Crawl (includes screenshots with Playwright)
+            logger.info("Phase 1: Crawling website with Playwright (JavaScript enabled)")
             self.crawled_pages = await self.crawler.crawl()
             self.report.pages_crawled = len(self.crawled_pages)
 
             # Save crawl metadata
             await self.storage.save_crawl_metadata(self.crawled_pages)
 
-            # Phase 2: Extract
-            logger.info("Phase 2: Extracting content")
-            await self._extract_content()
+            # Phase 2: Extract and save content to files
+            logger.info("Phase 2: Saving extracted content")
+            await self._save_extracted_content()
 
             # Save extraction index
             await self.storage.save_extracted_data_index(self.extracted_data)
@@ -118,14 +127,17 @@ class ScanOrchestrator:
         finally:
             await self._cleanup()
 
-    async def _extract_content(self) -> None:
-        """Extract content from all crawled pages."""
+    async def _save_extracted_content(self) -> None:
+        """Save extracted content (HTML, text) to files.
+
+        Screenshots are already captured during crawl phase.
+        """
         successful_pages = [p for p in self.crawled_pages if p.status == PageStatus.SUCCESS]
 
         for page in successful_pages:
             extracted = ExtractedData(url=page.url)
 
-            # Extract HTML and text in parallel
+            # Save HTML and text in parallel
             html_task = self.html_extractor.extract(page)
             text_task = self.text_extractor.extract(page)
 
@@ -136,20 +148,11 @@ class ScanOrchestrator:
             if not isinstance(results[1], Exception):
                 extracted.text_path = results[1]
 
+            # Screenshot was captured during crawl
+            if page.screenshot_path:
+                extracted.screenshot_path = Path(page.screenshot_path)
+
             self.extracted_data.append(extracted)
-
-        # Extract screenshots (done sequentially to avoid browser issues)
-        if self.screenshot_extractor:
-            logger.info("Capturing screenshots")
-            for i, extracted in enumerate(self.extracted_data):
-                page = next(p for p in self.crawled_pages if p.url == extracted.url)
-                try:
-                    screenshot_path = await self.screenshot_extractor.extract(page)
-                    extracted.screenshot_path = screenshot_path
-                except Exception as e:
-                    logger.warning("Screenshot failed", url=page.url, error=str(e))
-
-            await self.screenshot_extractor.stop()
 
     async def _analyze_content(self) -> None:
         """Run all analyzers on extracted content."""
@@ -232,9 +235,6 @@ class ScanOrchestrator:
 
     async def _cleanup(self) -> None:
         """Clean up resources."""
-        if self.screenshot_extractor:
-            await self.screenshot_extractor.stop()
-
         if self.grammar_analyzer:
             await self.grammar_analyzer.stop()
 

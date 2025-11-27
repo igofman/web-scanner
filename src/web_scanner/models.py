@@ -32,6 +32,7 @@ class CrawledPage:
     crawled_at: datetime = field(default_factory=datetime.now)
     error_message: str | None = None
     response_time_ms: float | None = None
+    screenshot_path: str | None = None  # Path to captured screenshot
 
 
 @dataclass
