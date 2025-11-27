@@ -1,0 +1,47 @@
+services:
+  web-scanner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: web-scanner
+    volumes:
+      # Mount local data and reports directories
+      - ./data:/app/data
+      - ./reports:/app/reports
+    environment:
+      - SCANNER_OUTPUT_DIR=/app/data
+      - SCANNER_REPORTS_DIR=/app/reports
+      - SCANNER_MAX_DEPTH=3
+      - SCANNER_MAX_PAGES=100
+      - SCANNER_CONCURRENT_REQUESTS=5
+    # Default command - can be overridden
+    command: ["--help"]
+    # Uncomment and modify to scan a specific URL:
+    # command: ["scan", "https://example.com", "--depth", "2", "--max-pages", "50"]
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
+
+    # Security options for Playwright
+    security_opt:
+      - seccomp:unconfined
+
+    # Network mode for accessing external websites
+    network_mode: bridge
+
+  # Optional: LanguageTool server for faster grammar checking
+  # Uncomment if you want to use a local LanguageTool server
+  # languagetool:
+  #   image: erikvl87/languagetool
+  #   container_name: languagetool
+  #   ports:
+  #     - "8010:8010"
+  #   environment:
+  #     - langtool_languageModel=/ngrams
+  #     - Java_Xms=512m
+  #     - Java_Xmx=2g
