@@ -1,6 +1,7 @@
 """Browser manager for Playwright-based web scraping."""
 
 import asyncio
+import random
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -18,6 +19,15 @@ from .config import settings
 
 logger = structlog.get_logger()
 
+# Realistic user agents for rotation
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+]
+
 
 class BrowserManager:
     """Manages Playwright browser lifecycle and provides page contexts."""
@@ -33,29 +43,90 @@ class BrowserManager:
             return
 
         self._playwright = await async_playwright().start()
+
+        # Launch with stealth-friendly settings
         self._browser = await self._playwright.chromium.launch(
             headless=True,
             args=[
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-accelerated-2d-canvas",
-                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
                 "--window-size=1920,1080",
+                # Additional stealth args
+                "--disable-infobars",
+                "--disable-extensions",
+                "--disable-gpu",
+                "--disable-web-security",
+                "--allow-running-insecure-content",
+                "--disable-client-side-phishing-detection",
+                # Force HTTP/1.1 to avoid HTTP/2 protocol errors from WAFs
+                "--disable-http2",
             ],
         )
 
-        # Create a persistent context with common settings
+        # Create a persistent context with stealth settings
         self._context = await self._browser.new_context(
             viewport={
                 "width": settings.screenshot_width,
                 "height": settings.screenshot_height,
             },
-            user_agent=settings.user_agent,
+            user_agent=settings.user_agent or random.choice(USER_AGENTS),
             ignore_https_errors=True,
             java_script_enabled=True,
-            bypass_csp=True,  # Bypass Content Security Policy for better scraping
+            bypass_csp=True,
+            # Add realistic browser properties
+            locale="en-US",
+            timezone_id="America/New_York",
+            geolocation={"latitude": 40.7128, "longitude": -74.0060},
+            permissions=["geolocation"],
+            color_scheme="light",
+            # Extra HTTP headers to appear more like a real browser
+            extra_http_headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+                "Cache-Control": "max-age=0",
+            },
         )
+
+        # Add stealth scripts to evade detection
+        await self._context.add_init_script("""
+            // Override the navigator.webdriver property
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined,
+            });
+
+            // Override the plugins property
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5],
+            });
+
+            // Override the languages property
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en'],
+            });
+
+            // Override chrome property
+            window.chrome = {
+                runtime: {},
+            };
+
+            // Override permissions
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) => (
+                parameters.name === 'notifications' ?
+                    Promise.resolve({ state: Notification.permission }) :
+                    originalQuery(parameters)
+            );
+        """)
 
         logger.info(
             "Browser started",

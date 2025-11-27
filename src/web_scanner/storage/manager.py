@@ -10,6 +10,7 @@ import structlog
 
 from ..config import settings
 from ..models import CrawledPage, ExtractedData, AnalysisReport
+from .html_report import generate_html_report
 
 logger = structlog.get_logger()
 
@@ -117,6 +118,42 @@ class StorageManager:
 
     async def save_analysis_report(self, report: AnalysisReport) -> Path:
         """Save the complete analysis report."""
+        # Calculate AI analysis summary stats
+        ai_summary = {}
+        if report.ai_analyses:
+            total_text_issues = sum(len(a.text_issues) for a in report.ai_analyses)
+            total_html_issues = sum(len(a.html_issues) for a in report.ai_analyses)
+            total_visual_issues = sum(len(a.visual_issues) for a in report.ai_analyses)
+
+            # Count by severity
+            all_ai_issues = []
+            for a in report.ai_analyses:
+                all_ai_issues.extend(a.text_issues)
+                all_ai_issues.extend(a.html_issues)
+                all_ai_issues.extend(a.visual_issues)
+
+            critical_count = sum(1 for i in all_ai_issues if i.severity == "critical")
+            warning_count = sum(1 for i in all_ai_issues if i.severity == "warning")
+            info_count = sum(1 for i in all_ai_issues if i.severity == "info")
+
+            # Calculate average visual score
+            visual_scores = [a.visual_score for a in report.ai_analyses if a.visual_score is not None]
+            avg_visual_score = sum(visual_scores) / len(visual_scores) if visual_scores else None
+
+            ai_summary = {
+                "pages_analyzed_by_ai": len(report.ai_analyses),
+                "total_text_issues": total_text_issues,
+                "total_html_issues": total_html_issues,
+                "total_visual_issues": total_visual_issues,
+                "total_ai_issues": total_text_issues + total_html_issues + total_visual_issues,
+                "issues_by_severity": {
+                    "critical": critical_count,
+                    "warning": warning_count,
+                    "info": info_count,
+                },
+                "average_visual_score": round(avg_visual_score, 2) if avg_visual_score else None,
+            }
+
         report_data = {
             "base_url": report.base_url,
             "scan_started": report.scan_started.isoformat(),
@@ -128,6 +165,7 @@ class StorageManager:
                 "total_link_issues": len(report.link_issues),
                 "total_ocr_issues": len(report.ocr_issues),
                 "total_errors": len(report.errors),
+                "ai_analysis": ai_summary if ai_summary else None,
             },
             "grammar_issues": [
                 {
@@ -161,6 +199,62 @@ class StorageManager:
                 }
                 for issue in report.ocr_issues
             ],
+            "ai_analysis": [
+                {
+                    "url": analysis.url,
+                    "visual_score": analysis.visual_score,
+                    "summaries": {
+                        "text": analysis.text_summary,
+                        "html": analysis.html_summary,
+                        "visual": analysis.visual_summary,
+                    },
+                    "text_issues": [
+                        {
+                            "severity": issue.severity,
+                            "category": issue.category,
+                            "description": issue.description,
+                            "location": issue.location,
+                            "suggestion": issue.suggestion,
+                            "original_text": issue.original,
+                        }
+                        for issue in analysis.text_issues
+                    ],
+                    "html_issues": [
+                        {
+                            "severity": issue.severity,
+                            "category": issue.category,
+                            "description": issue.description,
+                            "location": issue.location,
+                            "suggestion": issue.suggestion,
+                        }
+                        for issue in analysis.html_issues
+                    ],
+                    "visual_issues": [
+                        {
+                            "severity": issue.severity,
+                            "category": issue.category,
+                            "description": issue.description,
+                            "location": issue.location,
+                            "suggestion": issue.suggestion,
+                            "bbox": issue.bbox if hasattr(issue, 'bbox') else None,
+                            "evidence": issue.evidence if hasattr(issue, 'evidence') else None,
+                            "confidence": issue.confidence if hasattr(issue, 'confidence') else None,
+                        }
+                        for issue in analysis.visual_issues
+                    ],
+                    "text_corrections": [
+                        {
+                            "original": tc.original,
+                            "correction": tc.correction,
+                            "explanation": tc.explanation,
+                            "bbox": tc.bbox if hasattr(tc, 'bbox') else None,
+                            "confidence": tc.confidence if hasattr(tc, 'confidence') else None,
+                        }
+                        for tc in (analysis.text_corrections if hasattr(analysis, 'text_corrections') else [])
+                    ],
+                }
+                for analysis in report.ai_analyses
+            ] if report.ai_analyses else [],
             "errors": report.errors,
         }
 
@@ -172,6 +266,11 @@ class StorageManager:
         # Also save a human-readable summary
         summary_path = self.reports_dir / "summary.txt"
         await self._save_human_readable_summary(report, summary_path)
+
+        # Generate beautiful HTML report
+        html_path = self.reports_dir / "report.html"
+        generate_html_report(report, html_path)
+        logger.info("Saved HTML report", path=str(html_path))
 
         logger.info("Saved analysis report", path=str(filepath))
         return filepath
@@ -195,8 +294,29 @@ class StorageManager:
             f"Broken Links: {len(report.link_issues)}",
             f"OCR Issues: {len(report.ocr_issues)}",
             f"Errors: {len(report.errors)}",
-            "",
         ]
+
+        # Add AI Analysis summary if available
+        if report.ai_analyses:
+            total_text = sum(len(a.text_issues) for a in report.ai_analyses)
+            total_html = sum(len(a.html_issues) for a in report.ai_analyses)
+            total_visual = sum(len(a.visual_issues) for a in report.ai_analyses)
+            visual_scores = [a.visual_score for a in report.ai_analyses if a.visual_score]
+            avg_score = sum(visual_scores) / len(visual_scores) if visual_scores else None
+
+            lines.extend([
+                "",
+                "AI ANALYSIS SUMMARY",
+                "-" * 40,
+                f"Pages Analyzed by AI: {len(report.ai_analyses)}",
+                f"AI Text Issues: {total_text}",
+                f"AI HTML Issues: {total_html}",
+                f"AI Visual Issues: {total_visual}",
+            ])
+            if avg_score:
+                lines.append(f"Average Visual Score: {avg_score:.1f}/10")
+
+        lines.append("")
 
         if report.grammar_issues:
             lines.extend([
@@ -244,6 +364,104 @@ class StorageManager:
                 ])
             if len(report.ocr_issues) > 20:
                 lines.append(f"   ... and {len(report.ocr_issues) - 20} more issues")
+            lines.append("")
+
+        # AI Analysis detailed results
+        if report.ai_analyses:
+            lines.extend([
+                "=" * 80,
+                "AI-POWERED ANALYSIS DETAILS",
+                "=" * 80,
+                "",
+                "The AI analyzed text content, HTML structure, and visual appearance",
+                "of each page to identify issues that traditional tools might miss.",
+                "",
+            ])
+
+            for analysis in report.ai_analyses:
+                lines.extend([
+                    "-" * 80,
+                    f"PAGE: {analysis.url}",
+                    "-" * 80,
+                ])
+
+                if analysis.visual_score is not None:
+                    score_text = "Excellent" if analysis.visual_score >= 8 else "Good" if analysis.visual_score >= 6 else "Needs Improvement" if analysis.visual_score >= 4 else "Poor"
+                    lines.append(f"Visual Score: {analysis.visual_score:.1f}/10 ({score_text})")
+                    lines.append("")
+
+                # Text Analysis Summary
+                if analysis.text_summary:
+                    lines.extend([
+                        "TEXT ANALYSIS:",
+                        f"  {analysis.text_summary}",
+                        "",
+                    ])
+
+                # HTML Analysis Summary
+                if analysis.html_summary:
+                    lines.extend([
+                        "HTML ANALYSIS:",
+                        f"  {analysis.html_summary}",
+                        "",
+                    ])
+
+                # Visual Analysis Summary
+                if analysis.visual_summary:
+                    lines.extend([
+                        "VISUAL ANALYSIS:",
+                        f"  {analysis.visual_summary}",
+                        "",
+                    ])
+
+                # Critical Issues
+                all_issues = analysis.text_issues + analysis.html_issues + analysis.visual_issues
+                critical = [i for i in all_issues if i.severity == "critical"]
+                warnings = [i for i in all_issues if i.severity == "warning"]
+
+                if critical:
+                    lines.extend([
+                        f"CRITICAL ISSUES ({len(critical)}):",
+                    ])
+                    for issue in critical[:10]:
+                        lines.extend([
+                            f"  [{issue.category}] {issue.description}",
+                        ])
+                        if issue.location:
+                            lines.append(f"    Location: {issue.location}")
+                        if issue.suggestion:
+                            lines.append(f"    Fix: {issue.suggestion}")
+                        lines.append("")
+
+                if warnings:
+                    lines.extend([
+                        f"WARNINGS ({len(warnings)}):",
+                    ])
+                    for issue in warnings[:10]:
+                        lines.extend([
+                            f"  [{issue.category}] {issue.description}",
+                        ])
+                        if issue.suggestion:
+                            lines.append(f"    Fix: {issue.suggestion}")
+                        lines.append("")
+
+                lines.append("")
+
+        # Errors section
+        if report.errors:
+            lines.extend([
+                "ERRORS DURING SCAN",
+                "-" * 40,
+            ])
+            for error in report.errors:
+                lines.append(f"  - {error}")
+            lines.append("")
+
+        lines.extend([
+            "=" * 80,
+            "END OF REPORT",
+            "=" * 80,
+        ])
 
         async with aiofiles.open(filepath, "w", encoding="utf-8") as f:
             await f.write("\n".join(lines))

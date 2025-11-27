@@ -11,7 +11,7 @@ from .crawler import WebCrawler
 from .extractors import HTMLExtractor, TextExtractor
 from .analyzers import GrammarAnalyzer, LinkAnalyzer, OCRAnalyzer
 from .storage import StorageManager
-from .models import AnalysisReport, CrawledPage, ExtractedData, PageStatus
+from .models import AnalysisReport, CrawledPage, ExtractedData, PageStatus, AIPageAnalysis, AIIssue
 
 logger = structlog.get_logger()
 
@@ -33,6 +33,11 @@ class ScanOrchestrator:
         skip_grammar: bool = False,
         skip_links: bool = False,
         skip_ocr: bool = False,
+        enable_ai: bool = False,
+        ai_api_key: str | None = None,
+        ai_analyze_text: bool = True,
+        ai_analyze_html: bool = True,
+        ai_analyze_screenshots: bool = True,
         output_dir: Path | None = None,
     ):
         self.url = url
@@ -42,6 +47,11 @@ class ScanOrchestrator:
         self.skip_grammar = skip_grammar
         self.skip_links = skip_links
         self.skip_ocr = skip_ocr or skip_screenshots  # Can't do OCR without screenshots
+        self.enable_ai = enable_ai
+        self.ai_api_key = ai_api_key
+        self.ai_analyze_text = ai_analyze_text
+        self.ai_analyze_html = ai_analyze_html
+        self.ai_analyze_screenshots = ai_analyze_screenshots and not skip_screenshots
 
         # Initialize storage
         self.storage = StorageManager(url, output_dir)
@@ -66,6 +76,7 @@ class ScanOrchestrator:
         self.grammar_analyzer = GrammarAnalyzer() if not skip_grammar else None
         self.link_analyzer = LinkAnalyzer() if not skip_links else None
         self.ocr_analyzer = OCRAnalyzer() if not self.skip_ocr else None
+        self.ai_analyzer = None  # Initialized lazily when needed
 
         # Results
         self.crawled_pages: list[CrawledPage] = []
@@ -101,6 +112,11 @@ class ScanOrchestrator:
             # Phase 3: Analyze
             logger.info("Phase 3: Analyzing content")
             await self._analyze_content()
+
+            # Phase 4: AI Analysis (if enabled)
+            if self.enable_ai:
+                logger.info("Phase 4: Running AI-powered analysis")
+                await self._run_ai_analysis()
 
             self.report.scan_completed = datetime.now()
             self.report.pages_analyzed = len([
@@ -233,6 +249,121 @@ class ScanOrchestrator:
         finally:
             await self.ocr_analyzer.stop()
 
+    async def _run_ai_analysis(self) -> None:
+        """Run AI-powered analysis on content."""
+        logger.info("Running AI analysis")
+
+        try:
+            # Import here to avoid circular imports and make AI optional
+            from .ai import AIAnalyzer
+
+            self.ai_analyzer = AIAnalyzer(
+                api_key=self.ai_api_key,
+                analyze_text=self.ai_analyze_text,
+                analyze_html=self.ai_analyze_html,
+                analyze_screenshots=self.ai_analyze_screenshots,
+            )
+
+            # Get successful pages for analysis
+            successful_pages = [p for p in self.crawled_pages if p.status == PageStatus.SUCCESS]
+
+            if not successful_pages:
+                logger.info("No pages to analyze with AI")
+                return
+
+            # Run AI analysis on all pages
+            ai_results = await self.ai_analyzer.analyze_batch(
+                pages=successful_pages,
+                extracted_data=self.extracted_data,
+                concurrency=settings.ai_analysis_concurrency,
+            )
+
+            # Convert AI results to model format and add to report
+            for ai_result in ai_results:
+                page_analysis = AIPageAnalysis(
+                    url=ai_result.url,
+                    text_issues=[
+                        AIIssue(
+                            severity=issue.severity,
+                            category=issue.category,
+                            description=issue.description,
+                            location=issue.location,
+                            suggestion=issue.suggestion,
+                            original=issue.original,
+                            source_url=issue.source_url,
+                            source_type=issue.source_type,
+                        )
+                        for issue in ai_result.text_issues
+                    ],
+                    html_issues=[
+                        AIIssue(
+                            severity=issue.severity,
+                            category=issue.category,
+                            description=issue.description,
+                            location=issue.location,
+                            suggestion=issue.suggestion,
+                            original=issue.original,
+                            source_url=issue.source_url,
+                            source_type=issue.source_type,
+                        )
+                        for issue in ai_result.html_issues
+                    ],
+                    visual_issues=[
+                        AIIssue(
+                            severity=issue.severity,
+                            category=issue.category,
+                            description=issue.description,
+                            location=issue.location,
+                            suggestion=issue.suggestion,
+                            original=issue.original,
+                            source_url=issue.source_url,
+                            source_type=issue.source_type,
+                        )
+                        for issue in ai_result.visual_issues
+                    ],
+                    text_summary=ai_result.text_summary,
+                    html_summary=ai_result.html_summary,
+                    visual_summary=ai_result.visual_summary,
+                    visual_score=ai_result.visual_score,
+                )
+                self.report.ai_analyses.append(page_analysis)
+
+                # Add any errors from this page's analysis
+                for error in ai_result.errors:
+                    self.report.errors.append(f"AI analysis error for {ai_result.url}: {error}")
+
+            # Count total AI issues
+            total_text_issues = sum(len(a.text_issues) for a in self.report.ai_analyses)
+            total_html_issues = sum(len(a.html_issues) for a in self.report.ai_analyses)
+            total_visual_issues = sum(len(a.visual_issues) for a in self.report.ai_analyses)
+
+            logger.info(
+                "AI analysis complete",
+                pages_analyzed=len(self.report.ai_analyses),
+                text_issues=total_text_issues,
+                html_issues=total_html_issues,
+                visual_issues=total_visual_issues,
+            )
+
+        except ImportError as e:
+            error_msg = f"AI analysis module not available: {str(e)}"
+            logger.error(error_msg)
+            self.report.errors.append(error_msg)
+
+        except ValueError as e:
+            error_msg = f"AI analysis configuration error: {str(e)}"
+            logger.error(error_msg)
+            self.report.errors.append(error_msg)
+
+        except Exception as e:
+            error_msg = f"AI analysis failed: {str(e)}"
+            logger.error(error_msg)
+            self.report.errors.append(error_msg)
+
+        finally:
+            if self.ai_analyzer:
+                await self.ai_analyzer.stop()
+
     async def _cleanup(self) -> None:
         """Clean up resources."""
         if self.grammar_analyzer:
@@ -243,3 +374,6 @@ class ScanOrchestrator:
 
         if self.ocr_analyzer:
             await self.ocr_analyzer.stop()
+
+        if self.ai_analyzer:
+            await self.ai_analyzer.stop()

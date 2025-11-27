@@ -14,6 +14,10 @@ services:
       - SCANNER_MAX_DEPTH=3
       - SCANNER_MAX_PAGES=100
       - SCANNER_CONCURRENT_REQUESTS=5
+      # AI Analysis settings (optional - set your OpenRouter API key)
+      - SCANNER_OPENROUTER_API_KEY=${SCANNER_OPENROUTER_API_KEY:-}
+      - SCANNER_AI_MODEL=${SCANNER_AI_MODEL:-anthropic/claude-3.5-sonnet}
+      - SCANNER_AI_VISION_MODEL=${SCANNER_AI_VISION_MODEL:-anthropic/claude-3.5-sonnet}
     # Default command - can be overridden
     command: ["--help"]
     # Uncomment and modify to scan a specific URL:

@@ -53,6 +53,24 @@ class Settings(BaseSettings):
     # OCR settings
     tesseract_lang: str = Field(default="eng", description="Tesseract OCR language")
 
+    # AI/OpenRouter settings
+    openrouter_api_key: str | None = Field(
+        default=None,
+        description="OpenRouter API key for AI-powered analysis",
+    )
+    ai_model: str = Field(
+        default="anthropic/claude-3.5-sonnet",
+        description="AI model to use for text/HTML analysis",
+    )
+    ai_vision_model: str = Field(
+        default="openai/gpt-4o",
+        description="AI model to use for image/screenshot analysis (GPT-4o for best vision)",
+    )
+    ai_analysis_concurrency: int = Field(
+        default=2,
+        description="Number of concurrent AI analysis requests",
+    )
+
     model_config = {"env_prefix": "SCANNER_", "env_file": ".env"}
 
 
